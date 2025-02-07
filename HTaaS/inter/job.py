@@ -24,7 +24,7 @@ class Job:
             while True:
                 cmd, data = self._ipc.recv()
                 if cmd == 'pending':
-                    if int(data) > 20:
+                    if int(data) > 2000000000000000:
                         raise RuntimeError()
                 elif cmd == 'alloc':
                     gpu_list = data

@@ -29,7 +29,7 @@ class Launcher:
             print(f"Launch {self.trace['name'][self.now_index]} at time {time.time() - self.beg_time}")
             cmd = f"python3 {self.info['info'][self.trace['application'][self.now_index]]['path']}"
             print(cmd)
-            process = subprocess.Popen(cmd, stdout=open(f"./{self.trace['name'][self.now_index]}_output.log", 'a'), stderr=open(f"./{self.trace['name'][self.now_index]}_error.log", 'a'), text=True, shell=True)
+            process = subprocess.Popen(cmd, stdout=open(f"./log/{self.trace['name'][self.now_index]}_output.log", 'a'), stderr=open(f"./log/{self.trace['name'][self.now_index]}_error.log", 'a'), text=True, shell=True)
             self.process_list.append(process)
         else:
             print(f"Unkown application {self.trace['name'][self.now_index]} at time {time.time() - self.beg_time}")

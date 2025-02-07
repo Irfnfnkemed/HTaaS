@@ -86,7 +86,7 @@ class Scheduler:
                     self._pending_jobs.pop(job_id)
                 job_monitor_thread.start()
                 return
-            elif cnt <= 100:
+            elif cnt <= 1000000000000:
                 job_ipc.send('pending', cnt)
             else:
                 print(f'Fail to alloca resource for job{job_id}.')
