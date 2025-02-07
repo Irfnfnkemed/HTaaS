@@ -39,7 +39,7 @@ class Job:
                 else:
                     parsed_list[ip] = [gpu_id]
             parsed_gpu_list = [(ip, parsed_list[ip]) for ip, ids in parsed_list.items()]
-            master_port = get_free_port(parsed_gpu_list[0][0])
+            master_port = get_free_port(parsed_gpu_list[0][0], True)
             proxy_host = self._server.get_ip()
             proxy_port = self._server.get_port()
             cwd = script_path[:script_path.rfind('/')]
@@ -62,12 +62,15 @@ class Job:
                                ] + args
                 torchrun_cmd = " ".join(torchrun_cmd)
                 if add_cmd is not None:
-                    remote_shell_cmd = f"{env_set_cmd} && {" && ".join(add_cmd)} && pwd && export CUDA_VISIBLE_DEVICES={','.join(gpus)} && {torchrun_cmd}"
+                    additional = " && ".join(add_cmd)
+                    remote_shell_cmd = f"{env_set_cmd} && {additional} && pwd && export CUDA_VISIBLE_DEVICES={','.join(gpus)} && {torchrun_cmd}"
                 else:
                     remote_shell_cmd = f"{env_set_cmd} && pwd && export CUDA_VISIBLE_DEVICES={','.join(gpus)} && {torchrun_cmd}"
                 ssh_cmd = f"ssh {ip} \"bash -c '{remote_shell_cmd}'\""
-                print(ssh_cmd)
-                process = subprocess.Popen(ssh_cmd, stdout=open(f'./tmp_{job_id}/output.log', 'a'), stderr=open(f'./tmp_{job_id}/error.log', 'a'), text=True, shell=True)
+                print(f"bash -c '{remote_shell_cmd}'")
+                process = subprocess.Popen(f"bash -c '{remote_shell_cmd}'", stdout=open(f'./tmp_{job_id}/output.log', 'a'), stderr=open(f'./tmp_{job_id}/error.log', 'a'), text=True, shell=True)
+
+                ###### process = subprocess.Popen(ssh_cmd, stdout=open(f'./tmp_{job_id}/output.log', 'a'), stderr=open(f'./tmp_{job_id}/error.log', 'a'), text=True, shell=True)
                 self._process_list.append(process)
             server_ipc = self._server.accept()  # accept conn from rank0
             while True:

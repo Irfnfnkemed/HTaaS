@@ -1,0 +1,11 @@
+name,time,application,num_replicas,batch_size
+cifar10-1,10,cifar10,4,2048
+cifar10-2,107,cifar10,2,512
+ncf-3,135,ncf,1,32768
+cifar10-4,356,cifar10,4,4096
+ncf-5,539,ncf,1,32768
+ncf-6,631,ncf,1,32768
+ncf-7,682,ncf,1,32768
+cifar10-8,832,cifar10,2,4096
+ncf-9,953,ncf,1,32768
+cifar10-10,996,cifar10,6,2048

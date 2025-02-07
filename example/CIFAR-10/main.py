@@ -3,20 +3,20 @@ import time
 
 from models import *
 
-import FTaaS.intra.env as env
+import HTaaS.intra.env as env
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from FTaaS.intra.elements import DataLoaderArguments
-from FTaaS.intra.job import IntraOptim
+from HTaaS.intra.elements import DataLoaderArguments
+from HTaaS.intra.job import IntraOptim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 
 class CIFAR_job_optim(IntraOptim):
 
-    def __init__(self, model, trainloader_args, testloader, optimizer, epochs):
-        super().__init__(model, trainloader_args, testloader, optimizer, epochs)
+    def __init__(self, model, trainloader_args, testloader, optimizer, optimizer_adapt, epochs):
+        super().__init__(model, trainloader_args, testloader, optimizer, optimizer_adapt, epochs)
         self.loss_func = nn.CrossEntropyLoss()
 
     def get_input(self, device, data):
@@ -44,7 +44,7 @@ if __name__ == '__main__':
     # Parsing args
     parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
     parser.add_argument('--bs', default=2048, type=int, help='batch size')
-    parser.add_argument('--lr', default=1e-6, type=float, help='learning rate')
+    parser.add_argument('--lr', default=1e-9, type=float, help='learning rate')
     parser.add_argument('--epochs', default=60, type=int, help='number of epochs')
     parser.add_argument('--model', default='ResNet18', type=str, help='model')
     args = parser.parse_args()
@@ -72,8 +72,9 @@ if __name__ == '__main__':
     device = env.local_rank()
     model = eval(args.model)()
     model = model.to(device)
-    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+    optimizer = optim.SGD(model.parameters(), momentum=0.9, lr=args.lr, weight_decay=5e-4)
+    optimizer_adapt = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
 
-    job = CIFAR_job_optim(model, train_args, testloader, optimizer, args.epochs)
+    job = CIFAR_job_optim(model, train_args, testloader, optimizer, optimizer_adapt, args.epochs)
     job.load_checkpoint()
     job.run()

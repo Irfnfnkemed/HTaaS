@@ -1,0 +1,18 @@
+{
+    "application": [
+        "cifar10",
+        "ncf"
+    ],
+    "info": {
+        "cifar10": {
+            "path": "/home/guanjie/HTaaS/example/CIFAR-10/run.py",
+            "k": -0.88906,
+            "b": 8.57271
+        },
+        "ncf": {
+            "path": "/home/guanjie/HTaaS/example/NCF/run.py",
+            "k": -0.88906,
+            "b": 8.57271
+        }
+    }
+}

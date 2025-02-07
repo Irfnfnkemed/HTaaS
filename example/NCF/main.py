@@ -15,14 +15,14 @@ import evaluate
 import data_utils
 import os.path      
 
-from FTaaS.intra.elements import DataLoaderArguments
-from FTaaS.intra.job import IntraOptim
-import FTaaS.intra.env as env
+from HTaaS.intra.elements import DataLoaderArguments
+from HTaaS.intra.job import IntraOptim
+import HTaaS.intra.env as env
 
 class NCF_job_optim(IntraOptim):
     
-    def __init__(self, model, trainloader_args, testloader, optimizer, epochs, args):
-        super().__init__(model, trainloader_args, testloader, optimizer, epochs)
+    def __init__(self, model, trainloader_args, testloader, optimizer, optimizer_adapt, epochs, args):
+        super().__init__(model, trainloader_args, testloader, optimizer, optimizer_adapt, epochs)
         self.start_time = None
         self.loss_func = torch.nn.BCEWithLogitsLoss()
         self.args = args
@@ -54,7 +54,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--lr",
                         type=float,
-                        default=0.000001,
+                        default=0.0000001,
                         help="learning rate")
     parser.add_argument("--dropout",
                         type=float,
@@ -167,10 +167,11 @@ if __name__ == '__main__':
         optimizer = optim.SGD(network.parameters(), lr=args.lr)
     else:
         #optimizer = optim.SGD(network.parameters(), lr=args.lr)
-        optimizer = optim.Adam(network.parameters(), lr=args.lr)
+        optimizer = optim.AdamW(network.parameters(), lr=args.lr)
+    optimizer_adapt = optim.AdamW(network.parameters(), lr=args.lr)
     ########################### TRAINING #####################################
     
-    job = NCF_job_optim(network, train_args, test_loader, optimizer, args.epochs, args)
+    job = NCF_job_optim(network, train_args, test_loader, optimizer, optimizer_adapt, args.epochs, args)
     job.load_checkpoint()
     job.run()
     

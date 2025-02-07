@@ -170,7 +170,7 @@ class GradMonitor:
                         self.epb_average = self.epb_average * self.epb_ema + epb_corr * (1 - self.epb_ema)
                 self.epb_list.clear()
 
-    def _correct_epb(self, epb_list: List[float]) -> torch.Tensor | None:
+    def _correct_epb(self, epb_list: List[float]):
         for i, v in enumerate(epb_list):
             if v > i + 1.1:
                 return None  # Invalid epb-measurement
@@ -210,7 +210,7 @@ class GradMonitor:
         return self.ept_average
 
     @property
-    def epb(self) -> (torch.Tensor | None):
+    def epb(self):
         if self.epb_average is None:
             return None
         return torch.log2(self.epb_average - 1)
@@ -224,11 +224,11 @@ class Adjuster:
 
         # config of ept
         self.warmup_ept = 20
-        self.adjust_interval = 4
+        self.adjust_interval = 5
         self.low_error = -0.03
         self.high_error = 0.05
         self.eta = 3
-        self.standard_ept = 1.35
+        self.standard_ept = 1.3
         self.now_steps = 0
         self.fit_lr_steps = 0
         self.freeze_lr_bound = 15
@@ -236,8 +236,8 @@ class Adjuster:
 
         # config of epb
         self.max_step = 30
-        self.lower_bound = 0.5
-        self.upper_bound = 1.5
+        self.lower_bound = -0.5
+        self.upper_bound = 0.5
         self.max_bs = 1000
         self.min_bs = 10
         self.max_global_bs = 0

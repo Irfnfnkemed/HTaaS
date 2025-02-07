@@ -15,8 +15,8 @@ def get_ip() -> str:
     return ip
 
 
-def get_free_port(ip: str = '') -> int:
-    if ip == "" or ip == '127.0.0.1' or ip == 'localhost':
+def get_free_port(ip: str = '', local=False) -> int:
+    if ip == "" or ip == '127.0.0.1' or ip == 'localhost' or local:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("", 0))

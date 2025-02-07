@@ -18,13 +18,14 @@ from ..inter.ipc import ClientIPC
 class IntraOptim(ABC):
 
     def __init__(self, model: torch.nn.Module, trainloader_args: DataLoaderArguments,
-                 testloader: DataLoader, optimizer: torch.optim.Optimizer, epochs: int):
+                 testloader: DataLoader, optimizer: torch.optim.Optimizer, optimizer_adapt: torch.optim.Optimizer, epochs: int):
         if not dist.is_available() or not dist.is_initialized():
             dist.init_process_group(backend='nccl', world_size=world_size(), rank=rank())
         self._model = DDP(model, device_ids=[local_rank()], output_device=local_rank())
         self._trainloader_args = trainloader_args
         self._testloader = testloader
         self._optimizer = optimizer
+        self._optimizer_adapt = optimizer_adapt
         self._epochs = epochs
         self._ideal_global_bs = 0
         self._accumulation_steps = 1
@@ -33,6 +34,7 @@ class IntraOptim(ABC):
         self._ipc = ClientIPC()
         self._now_epochs = 0
         self._trainloader = None
+        self._adapt = False
 
         self._grad_monitor.associate(self._model)
         self._adjuster.associate(self._optimizer, self._grad_monitor)
@@ -60,14 +62,19 @@ class IntraOptim(ABC):
             'max_bs': self._adjuster.max_bs,
             'max_global_bs': self._adjuster.max_global_bs,
             'ideal_global_bs': self._ideal_global_bs,
-            'accumulation_steps': self._accumulation_steps
+            'accumulation_steps': self._accumulation_steps,
+            'adapt': self._adapt,
         }
-        torch.save(checkpoint, f'./tmp_{self._job_id}/checkpoint.pth')
+        torch.save(checkpoint, f'/home/guanjie/HTaaS/launch/tmp_{self._job_id}/checkpoint.pth')
 
     def load_checkpoint(self):
-        if os.path.exists(f'./tmp_{self._job_id}/checkpoint.pth'):
+        if os.path.exists(f'/home/guanjie/HTaaS/launch/tmp_{self._job_id}/checkpoint.pth'):
             print("Loading from checkpoint")
-            checkpoint = torch.load(f'./tmp_{self._job_id}/checkpoint.pth', weights_only=True)
+            checkpoint = torch.load(f'/home/guanjie/HTaaS/launch/tmp_{self._job_id}/checkpoint.pth', weights_only=True)
+            self._adapt = checkpoint['adapt']
+            if self._adapt:
+                self._optimizer = self._optimizer_adapt
+                self._optimizer_adapt = None
             self._epochs = checkpoint['epochs']
             self._model.module.load_state_dict(checkpoint['model'])
             self._optimizer.load_state_dict(checkpoint['optimizer'])
@@ -78,6 +85,9 @@ class IntraOptim(ABC):
             self._adjuster.set_accumulate_steps(self._accumulation_steps)
             self._adjuster.set_init_bs_config(checkpoint['max_bs'], checkpoint['max_global_bs'])
             self._grad_monitor.set_accumulation_steps(self._accumulation_steps)
+
+
+            
         else:
             self.profile_max_bs()
 
@@ -95,7 +105,7 @@ class IntraOptim(ABC):
                 loader_args['shuffle'] = self._trainloader_args.shuffle
                 bs = math.ceil(ideal_global_bs / accumu_steps) 
                 dataloader = DataLoader(batch_size=bs, **loader_args)
-                if len(dataloader) <= 20 * accumu_steps:
+                if len(dataloader) <= 5 * accumu_steps:
                     break
                 sample_epb = []
                 for index, data in enumerate(dataloader):
@@ -109,7 +119,7 @@ class IntraOptim(ABC):
                         self._model.zero_grad()
                         if epb is not None:
                             sample_epb.append(epb)
-                        if len(sample_epb) >= 5:
+                        if len(sample_epb) >= 3:
                             sample_epb = np.array(sample_epb)
                             q1 = np.percentile(sample_epb, 25)
                             q3 = np.percentile(sample_epb, 75)
@@ -129,6 +139,7 @@ class IntraOptim(ABC):
                         break
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
+                    print("AAAAAAAAAAAAAAAAAAAAAAAAAAA")
                     break
                 else:
                     raise
@@ -159,6 +170,7 @@ class IntraOptim(ABC):
         
         k = ((x * y).mean() - x.mean() * y.mean()) / ((x ** 2).mean() - (x.mean()) ** 2)
         b = y.mean() - k * x.mean()
+        print(f"k={k},b={b}", math.ceil(ideal_global_bs / accumu_steps / 2))
         
         
         self.update_epb_standard()
@@ -246,6 +258,16 @@ class IntraOptim(ABC):
             self._optimizer.step()
             self.on_step_end(index, data, input, output, loss)
             self._optimizer.zero_grad()
+            if self._grad_monitor.stop_ept and not self._adapt:
+                lr_list = []
+                for param_group in self._optimizer.param_groups:
+                    lr_list.append(param_group['lr'])
+                self._optimizer = self._optimizer_adapt
+                for i, param_group in enumerate(self._optimizer.param_groups):
+                    param_group['lr'] = lr_list[i]
+                self._adjuster.associate(self._optimizer, self._grad_monitor)
+                self._optimizer_adapt = None
+                self._adapt = True
 
         self.on_batch_end(index, data, input, output, loss)
 
@@ -259,6 +281,8 @@ class IntraOptim(ABC):
             epb_standard = torch.tensor(float(standard)).to(local_rank())
         dist.broadcast(epb_standard, src=0)
         epb_standard = epb_standard.item()
+        ##############################
+        epb_standard = 0.0
         self._adjuster.set_bs_config(epb_standard)
 
     def adjust_resources(self):
