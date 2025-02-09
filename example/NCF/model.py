@@ -91,9 +91,7 @@ class NCF(nn.Module):
             self.predict_layer.weight.data.copy_(0.5 * predict_weight)
             self.predict_layer.bias.data.copy_(0.5 * precit_bias)
 
-    def forward(self, data):
-        user = data[0]
-        item = data[1]
+    def forward(self, user, item):
         if not self.model == 'MLP':
             embed_user_GMF = self.embed_user_GMF(user)
             embed_item_GMF = self.embed_item_GMF(item)
