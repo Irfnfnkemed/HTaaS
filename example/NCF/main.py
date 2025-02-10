@@ -2,15 +2,11 @@
 
 import json
 import os
-
 import pandas as pd
-os.environ['MASTER_ADDR'] = 'localhost'
-os.environ['MASTER_PORT'] = '12111'
 import time
 import argparse
 from typing import List, Dict, Tuple
 import numpy as np
-
 import torch
 import torch.nn
 import torch.optim as optim
@@ -19,13 +15,28 @@ import torch.distributed as dist
 import torch.utils.data.distributed
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
-
 import model
 import evaluate
 import data_utils
 import os.path
 import tqdm
 import math
+
+
+def master_wrapper(func):
+    def wrapper(*args, **kwargs):
+        if dist.get_rank() == 0:
+            return func(*args, **kwargs)
+        else:
+            return None
+
+    return wrapper
+
+
+print = master_wrapper(print)
+
+os.environ['MASTER_ADDR'] = 'localhost'
+os.environ['MASTER_PORT'] = '12111'
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--lr",
@@ -42,7 +53,7 @@ parser.add_argument("--batch_size",
                     help="batch size for training")
 parser.add_argument("--epochs",
                     type=int,
-                    default=20,
+                    default=1,
                     help="training epoches")
 parser.add_argument("--top_k",
                     type=int,
@@ -96,7 +107,47 @@ parser.add_argument("--port",
 args = parser.parse_args()
 os.environ['MASTER_PORT'] = args.port
 
+
+class Timer:
+    def __init__(self):
+        self.total = 0
+        self.cur = 0
+
+    def beg(self):
+        self.cur = time.time()
+        return self
+
+    def end(self):
+        self.total += time.time() - self.cur
+        return self
+
+    def get(self):
+        return self.total
+
+    @staticmethod
+    def timer_wrapper(cls_name: str, timer_name: str):
+        def decorator(func):
+            def wrapper(*args, **kwargs):
+                assert cls_name in globals(), f"{cls_name} not in globals"
+                assert eval(cls_name).timers is not None, f"{cls_name}.timers is None"
+                assert timer_name in eval(cls_name).timers, f"{timer_name} not in {cls_name}.timers"
+
+                eval(cls_name).timers[timer_name].beg()
+                res = func(*args, **kwargs)
+                eval(cls_name).timers[timer_name].end()
+
+                return res
+
+            return wrapper
+
+        return decorator
+
+
 class GradMonitor:
+    timers = {
+        "timer_monitor_epb": Timer(),
+        "timer_monitor_ept": Timer(),
+    }
 
     def __init__(self):
         self._model: DDP = None
@@ -122,11 +173,21 @@ class GradMonitor:
         self.grad_dim = 0
         self.grad_mask = []
         self.grad_mask_len = []
-        
+
         self.para_grad = None
-        
+
         self.stop_ept = False
         self.stop_epb = False
+
+        import atexit
+        atexit.register(self.final_report)
+
+    def final_report(self):
+        timer_data = {
+            "timer_monitor_epb": self.timers["timer_monitor_epb"].get(),
+            "timer_monitor_ept": self.timers["timer_monitor_ept"].get()
+        }
+        print(f"timer_data: {json.dumps(timer_data, indent=4)}")
 
     def associate(self, model: DDP):
         self._model = model
@@ -157,7 +218,8 @@ class GradMonitor:
         for index, param in enumerate(self._model.parameters()):
             if len(self.grad_mask) > 0:
                 if param.grad is not None:
-                    self.para_grad[cur_index: cur_index + self.grad_mask_len[index]] = param.grad.view(-1)[self.grad_mask[index]]
+                    self.para_grad[cur_index: cur_index + self.grad_mask_len[index]] \
+                        = param.grad.view(-1)[self.grad_mask[index]]
                 cur_index += self.grad_mask_len[index]
             else:
                 num_ele = param.data.numel()
@@ -165,17 +227,22 @@ class GradMonitor:
                     self.para_grad[cur_index: cur_index + num_ele] = param.grad.view(-1)
                 cur_index += num_ele
 
+    @Timer.timer_wrapper("GradMonitor", "timer_monitor_ept")
     def monitor_ept(self):
         if self.stop_ept:
+            print(f"stop_ept: {self.stop_ept}")
             return
         self._monitor_grad()
         self.mean_ept = self.gamma * self.mean_ept + (1 - self.gamma) * self.para_grad
         self.variance_ept = self.gamma * self.variance_ept + (1 - self.gamma) * (self.para_grad ** 2)
         ept = self._ept()
         self.ept_average = self.ept_average * self.ept_ema + ept * (1 - self.ept_ema)
-        
+        print(f"monitor_ept: {ept}")
+
+    @Timer.timer_wrapper("GradMonitor", "timer_monitor_epb")
     def monitor_epb(self, flag: bool):
         if self.stop_epb:
+            print(f"stop_epb: {self.epb}")
             return
         if dist.get_world_size() > 1 and flag:
             self._monitor_grad()
@@ -203,7 +270,8 @@ class GradMonitor:
 
             dist.barrier()
             epb = self._epb().clone().detach().to(dist.get_rank())
-            epb_gather_list = [torch.zeros(1, dtype=torch.float32, device=dist.get_rank()) for _ in range(dist.get_world_size())]
+            epb_gather_list = [torch.zeros(1, dtype=torch.float32, device=dist.get_rank())
+                               for _ in range(dist.get_world_size())]
             dist.all_gather(epb_gather_list, epb)
             epb_gather_list = [tensor.to('cpu').item() for tensor in epb_gather_list]
             epb_corr = self._correct_epb(epb_gather_list)
@@ -229,8 +297,9 @@ class GradMonitor:
                     elif 1 < epb_corr < self.epb_average * 10:
                         self.epb_average = self.epb_average * self.epb_ema + epb_corr * (1 - self.epb_ema)
                 self.epb_list.clear()
+        print(f"monitor_epb: {self.epb}")
 
-    def _correct_epb(self, epb_list: List[float]) -> torch.Tensor | None:
+    def _correct_epb(self, epb_list: List[float]):
         for i, v in enumerate(epb_list):
             if v > i + 1.1:
                 return None  # Invalid epb-measurement
@@ -270,11 +339,12 @@ class GradMonitor:
         return self.ept_average
 
     @property
-    def epb(self) -> (torch.Tensor | None):
+    def epb(self):
         if self.epb_average is None:
             return None
         return torch.log2(self.epb_average - 1)
-    
+
+
 class Adjuster:
 
     def __init__(self):
@@ -311,11 +381,11 @@ class Adjuster:
     def adjust_lr(self):
         self.now_steps += 1
         if self.freeze_lr:
+            print(f"stop_lr: {self._optimizer.param_groups[0]['lr']}")
             return
         if self.now_steps > self.warmup_ept and self.now_steps % self.adjust_interval == 0:
             ept = self._grad_monitor.ept
             rate = (10 ** ((self.standard_ept - ept) / self.eta)).item()
-            print(ept)
             if self.low_error <= ept - self.standard_ept <= self.high_error or \
                     math.isnan(rate) or math.isinf(rate):
                 rate = 1.0
@@ -323,17 +393,17 @@ class Adjuster:
             else:
                 self.fit_lr_steps = max(0, self.fit_lr_steps - 1)
             for param_group in self._optimizer.param_groups:
-                print(param_group['lr'])
                 param_group['lr'] *= rate
             # print("!!!!!!!!!!!", self.fit_lr_steps)
             if self.fit_lr_steps > self.freeze_lr_bound:
                 self.freeze_lr = True
                 self._grad_monitor.stop_ept = True
-                
+        print(f"adjust_lr: {self._optimizer.param_groups[0]['lr']}")
 
     def adjust_bs(self, bs: int) -> int:
         epb = self._grad_monitor.epb
         if self.freeze_bs:
+            print(f"stop_bs: {bs}")
             return bs
         if self.lower_bound + self.bias <= epb <= self.upper_bound + self.bias:
             new_bs = bs
@@ -346,9 +416,10 @@ class Adjuster:
         if new_bs > self.max_global_bs:
             self.freeze_bs = True
             self._grad_monitor.stop_epb = True
-        return min(new_bs, self.max_global_bs)
-    
-    
+        new_bs = min(new_bs, self.max_global_bs)
+        print(f"adjust_bs: {new_bs}")
+        return new_bs
+
     def set_accumulate_steps(self, new_accumulate_step):
         self.accumulation_step = new_accumulate_step
 
@@ -364,65 +435,50 @@ class Adjuster:
 
     def get_num(self):
         return self.accumulation_step if dist.get_world_size() == 1 else dist.get_world_size()
-    
+
     def set_init_bs_config(self, max_bs: int, max_global_bs: int):
         self.max_bs = max_bs
         self.max_global_bs = max_global_bs
 
-    
-class Timer:
-    def __init__(self):
-        self.total = 0
-        self.cur = 0
-    
-    def beg(self):
-        self.cur = time.time()
-        
-    def end(self):
-        self.total += time.time() - self.cur
-        
-    def get(self):
-        return self.total
 
-
-    
-    
 def main(rank, world_size):
-    ALL_BEG_TIME = time.time()
-    
     # 设备配置
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
-
 
     dataset = args.dataset
     model_type = args.model_type
     # paths
-    main_path = "./data"
+    main_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 
-    train_rating = os.path.join(main_path, '{}.train.rating'.format(dataset))
-    test_rating = os.path.join(main_path, '{}.test.rating'.format(dataset))
-    test_negative = os.path.join(main_path, '{}.test.negative'.format(dataset))
+    dataset_path = os.path.join(main_path, "dataset")
+    train_rating = os.path.join(dataset_path, '{}.train.rating'.format(dataset))
+    test_rating = os.path.join(dataset_path, '{}.test.rating'.format(dataset))
+    test_negative = os.path.join(dataset_path, '{}.test.negative'.format(dataset))
 
     model_path = os.path.join(main_path, 'models')
     GMF_model_path = os.path.join(model_path, 'GMF.pth')
     MLP_model_path = os.path.join(model_path, 'MLP.pth')
     NeuMF_model_path = os.path.join(model_path, 'NeuMF.pth')
 
+    info_path = os.path.join(main_path, 'info', f'{args.lr}_{args.batch_size}.csv')
+    overhead_path = os.path.join(main_path, 'overhead', f'{args.lr}_{args.batch_size}.json')
+
     ############################## PREPARE DATASET ##########################
     train_data, test_data, user_num, item_num, train_mat = \
-        data_utils.load_all(main_path, train_rating, test_negative, dataset)
+        data_utils.load_all(dataset_path, train_rating, test_negative, dataset)
 
     # construct the train and test datasets
     train_dataset = data_utils.NCFData(train_data, item_num, train_mat, args.num_ng, True)
     test_dataset = data_utils.NCFData(test_data, item_num, train_mat, 0, False)
-    
+
     # 创建分布式Sampler
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
-        
+
     # 创建支持分布式训练的DataLoader
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size//world_size, sampler=train_sampler, num_workers=0, drop_last=True)
-    test_loader = DataLoader(test_dataset, batch_size=args.test_num_ng+1, shuffle=False, num_workers=0) 
-    
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size // world_size, sampler=train_sampler,
+                              num_workers=0, drop_last=True)
+    test_loader = DataLoader(test_dataset, batch_size=args.test_num_ng + 1, shuffle=False, num_workers=0)
+
     ########################### CREATE MODEL #################################
     if model_type == 'NeuMF-pre':
         assert os.path.exists(GMF_model_path), 'lack of GMF model'
@@ -443,36 +499,38 @@ def main(rank, world_size):
     monitor = GradMonitor()
     adjuster = Adjuster()
     monitor.associate(network)
-    
-    
-    timer_monitor = Timer()
-    timer_eval = Timer()
 
+    timer_adjust_bsz = Timer()
+    timer_adjust_lr = Timer()
+    timer_eval = Timer()
+    timer_profile = Timer()
+    timer_train = Timer()
 
     if model_type == 'NeuMF-pre':
         optimizer = optim.SGD(network.parameters(), lr=args.lr)
     else:
-        #optimizer = optim.SGD(network.parameters(), lr=args.lr)
+        # optimizer = optim.SGD(network.parameters(), lr=args.lr)
         optimizer = optim.AdamW(network.parameters(), lr=args.lr)
-        
+
     adjuster.associate(optimizer, monitor)
-        
+
     result = {"time": [], "GRT": [], "GRS": [], "valid": [], "loss": []}
-    
+
     train_loader.dataset.ng_sample()
-    
-    
+
     # profile
+    timer_profile.beg()
     network.train()
     cur_bs = 2
     epb_list = []
     while True:
         try:
-            train_loader = DataLoader(train_dataset, batch_size=cur_bs//world_size, sampler=train_sampler, num_workers=0, drop_last=True)
+            train_loader = DataLoader(train_dataset, batch_size=cur_bs // world_size, sampler=train_sampler,
+                                      num_workers=0, drop_last=True)
             if len(train_loader) <= 20:
                 break
             sample_epb = []
-                     
+
             for index, (user, item, label) in enumerate(train_loader):
                 with network.no_sync():
                     user = user.to(rank)
@@ -510,9 +568,9 @@ def main(rank, world_size):
                 break
             else:
                 raise
-            
-    print(epb_list)
-    
+
+    print(f'epb_list: {epb_list}')
+
     x = np.arange(0, len(epb_list))
     y = np.array(epb_list)
     condition = (y >= -5) & (y <= 5)
@@ -535,28 +593,27 @@ def main(rank, world_size):
     condition[max_start:max_end + 1] = True
     x = x[condition]
     y = y[condition]
-    
+
     k = ((x * y).mean() - x.mean() * y.mean()) / ((x ** 2).mean() - (x.mean()) ** 2)
     b = y.mean() - k * x.mean()
-    
+
     adjuster.set_bs_config(0)
     ideal = (adjuster.lower_bound + adjuster.upper_bound) / 2 + adjuster.bias
     ideal_global_bs = math.ceil(2 ** ((ideal - b) / k))
     adjuster.set_init_bs_config(int(cur_bs / 2 / world_size), ideal_global_bs * 16)
-    
-    
-        
+    timer_profile.end()
+    print(f"profiling_time: {timer_profile.get()}")
+
     ########################### TRAINING #####################################
-    TRAIN_BEG_TIME = time.time()
-    print(ALL_BEG_TIME-TRAIN_BEG_TIME)
-    return
-    
+
+    timer_train.beg()
     bs = ideal_global_bs
     for epoch in range(args.epochs):
-        train_loader = DataLoader(train_dataset, batch_size=bs//world_size, sampler=train_sampler, num_workers=0, drop_last=True)        
-        
+        train_loader = DataLoader(train_dataset, batch_size=bs // world_size, sampler=train_sampler, num_workers=0,
+                                  drop_last=True)
+
         print("bs:", bs)
-        
+
         network.train()  # Enable dropout (if have).
         start_time = time.time()
         train_loader.dataset.ng_sample()
@@ -569,71 +626,77 @@ def main(rank, world_size):
                 prediction = network(user, item)
                 loss = loss_function(prediction, label)
                 loss.backward()
-                
-                timer_monitor.beg()
-                if (index + 1) % 5 == 0: 
+
+                if (index + 1) % 5 == 0:
                     monitor.monitor_epb(True)
-                timer_monitor.end()
-            
+
             if world_size > 1:
                 for param in network.parameters():
                     if param.grad is not None:
                         dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
                         param.grad /= world_size
 
-            timer_monitor.beg()
             monitor.monitor_ept()
+            timer_adjust_lr.beg()
             adjuster.adjust_lr()
-            timer_monitor.end()
-            
+            timer_adjust_lr.end()
+
             # x_index = epoch + index / len(train_loader)
             # if monitor.t < 100:
             #     with open(f'ep/ept_{args.lr}_{args.batch_size}_{world_size}.txt', 'a') as file:
             #         file.write(f'{x_index} {monitor.ept}\n')
             #     with open(f'ep/epb_{args.lr}_{args.batch_size}_{world_size}.txt', 'a') as file:
             #         file.write(f'{x_index} {monitor.epb}\n')
-            
+
             optimizer.step()
-                           
-        timer_eval.beg() 
-        network.eval()        
+
+        timer_eval.beg()
+        network.eval()
         HR, NDCG = evaluate.metrics(network, test_loader, args.top_k)
         elapsed_time = time.time() - start_time
         print("The time elapse of epoch {:03d}".format(epoch) + " is: " +
-            time.strftime("%H: %M: %S", time.gmtime(elapsed_time)))
+              time.strftime("%H: %M: %S", time.gmtime(elapsed_time)))
         print("HR: {:.3f}\tNDCG: {:.3f}".format(np.mean(HR), np.mean(NDCG)))
-        timer_eval.end() 
-        
+        timer_eval.end()
+
         # if rank == 0:   
         #     with open(f'ep/HR_{args.lr}_{args.batch_size}_{world_size}.txt', 'a') as file:
         #         file.write(f'{x_index} {np.mean(HR)}\n')
         #     with open(f'ep/NDCG_{args.lr}_{args.batch_size}_{world_size}.txt', 'a') as file:
         #         file.write(f'{x_index} {np.mean(NDCG)}\n') 
-        
-        result['time'].append(time.time() - TRAIN_BEG_TIME)
-        result['GRT'].append(monitor.ept.item())      
+
+        result['time'].append(timer_train.end().beg().get())
+        result['GRT'].append(monitor.ept.item())
         result['GRS'].append(monitor.epb.item() - 1)
-        result['valid'].append(np.mean(HR))                     
+        result['valid'].append(np.mean(HR))
         result['loss'].append(loss.item())
-          
+
         dist.barrier()
-        
-        timer_monitor.beg()
+
+        timer_adjust_bsz.beg()
         bs = adjuster.adjust_bs(bs)
+        timer_adjust_bsz.end()
         # lr_scheduler.step()
-        timer_monitor.end()            
+
+    timer_train.end()
 
     df = pd.DataFrame(result)
-    df.to_csv(f'info/{args.lr}_{args.batch_size}.csv', index=False)
-    
-    data = {
-        'preprocessing_time': TRAIN_BEG_TIME - ALL_BEG_TIME,
-        'monitor_time': timer_monitor.get(),
-        'eval_time': timer_eval.get(),
-    }
-    with open(f'overhead/{args.lr}_{args.batch_size}.json', 'w') as file:
-        json.dump(data, file)
+    df.to_csv(info_path, index=False)
+    print(f"df: {df}")
 
+    overhead_data = {
+        'profiling_time': timer_profile.get(),
+        'eval_time': timer_eval.get(),
+        'timer_monitor_epb': monitor.timers["timer_monitor_epb"].get(),
+        'timer_monitor_ept': monitor.timers["timer_monitor_ept"].get(),
+        'timer_adjust_bsz': timer_adjust_bsz.get(),
+        'timer_adjust_lr': timer_adjust_lr.get(),
+        'timer_train': timer_train.get(),
+    }
+    print(f"overhead_data: {json.dumps(overhead_data, indent=4)}")
+
+    with open(overhead_path, 'w') as file:
+        json.dump(overhead_data, file)
 
 
 if __name__ == "__main__":
