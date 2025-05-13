@@ -33,13 +33,15 @@ class trainer(ABC):
     total_epochs: int
     now_epochs: int
     job_id: int
+    gpu_mem_utilization: float
     
     
      
 
     def __init__(self, model: torch.nn.Module, trainset: Dataset, 
                  trainloader_args: Dict[str, Any], testloader: DataLoader,
-                 optimizer: Optional[torch.optim.Optimizer], total_epochs: int):
+                 optimizer: Optional[torch.optim.Optimizer], total_epochs: int, 
+                 gpu_mem_utilization: float = 0.85):
         if not dist.is_available() or not dist.is_initialized():
             dist.init_process_group(backend='nccl', world_size=world_size(), rank=rank())
         # initialize the trainer
@@ -56,6 +58,7 @@ class trainer(ABC):
         self.conn_to_processor = ClientInstance()
         self.total_epochs = total_epochs
         self.now_epochs = 0
+        self.gpu_mem_utilization = gpu_mem_utilization
 
         # connect to processor and get job-id
         tmp_buffer = torch.tensor(0).to(local_rank())
@@ -109,95 +112,77 @@ class trainer(ABC):
         else:
             self.profile_max_bs()
 
-    def profile_max_bs(self):
+    def profile(self):
+        max_mem = torch.cuda.get_device_properties(self.model.device).total_memory * self.gpu_mem_utilization
         assert world_size() == 1
-        self._model.train()
-        ideal_global_bs = 4
-        accumu_steps = 4
-        self._adjuster.set_accumulate_steps(accumu_steps)
-        self._grad_monitor.set_accumulation_steps(accumu_steps)
-        epb_list = []
-        while True:
-            try:
-                loader_args = self._trainloader_args.get_args()
-                loader_args['shuffle'] = self._trainloader_args.shuffle
-                bs = math.ceil(ideal_global_bs / accumu_steps) 
-                dataloader = DataLoader(batch_size=bs, **loader_args)
-                if len(dataloader) <= 5 * accumu_steps:
+        self.model.train()
+        GRs_list = []
+        mem_list = []
+        bs_list = []
+        max_r2 = 0
+        best_slope_GRs, best_intercept_GRs = 0.0, 0.0 
+        slope_mem, intercept_mem = 0.0, 0.0
+        try:
+            for log_bs in range(15):
+                # profile the memory-use and GRs 
+                bs = 2 ** log_bs # local batch size
+                torch.cuda.reset_peak_memory_stats()
+                self.trainloader.set_new_bs(bs)
+                with self.trainloader.gen_static_data as datas_grs:
+                    tmp_counter = Counter()
+                    for _, data_grs in datas_grs:
+                        tmp_counter.step()
+                        input_grs = self.get_input(local_rank(), data_grs)
+                        output_grs = self.model(input_grs)
+                        loss_grs = self.get_loss(local_rank(), data_grs, output_grs) / tmp_counter.accum
+                        loss_grs.backward()
+                        if tmp_counter.need_update:
+                            self.grad_monitor.monitor_GRs(True)
+                            self.optimizer.zero_grad()
+                            if tmp_counter.iter_count == GRS_ACC_TIMES:
+                                break # end monitoring GRs
+                GRs_list.append(self.grad_monitor.GRs)
+                mem_list.append(torch.cuda.max_memory_allocated())
+                bs_list.append(bs)                   
+                # try to fit GRs = log(mu/B)
+                beg_index = 0 if log_bs < PROFILE_WINDOW else log_bs - PROFILE_WINDOW + 1
+                # bs_list is the local bs, need to mul with world size when fit GRs
+                x = np.log2(np.array(bs_list[beg_index:]) * world_size()) 
+                y = np.array(GRs_list[beg_index:])
+                slope, intercept = np.polyfit(x, y, 1)
+                y_fit = slope * x + intercept
+                ss_res = np.sum((y - y_fit) ** 2)
+                ss_tot = np.sum((y - np.mean(y)) ** 2)
+                r2 = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+                if r2 > max_r2:
+                    max_r2 = r2
+                    best_slope_GRs, best_intercept_GRs = slope, intercept
+                if r2 > 0.995:
+                    break # end profiling
+                # fit memory with bs, try to avoid OOM
+                x = np.array(mem_list)
+                y = np.array(bs_list)
+                slope_mem, intercept_mem = np.polyfit(x, y, 1)
+                y_fit = slope_mem * x + intercept_mem
+                ss_res = np.sum((y - y_fit) ** 2)
+                ss_tot = np.sum((y - np.mean(y)) ** 2)
+                r2 = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+                print(r2)
+                max_log_bs = np.log2((max_mem - intercept_mem) / slope_mem)
+                if log_bs + 1 > max_log_bs:
                     break
-                sample_epb = []
-                for index, data in enumerate(dataloader):
-                    input = self.get_input(local_rank(), data)
-                    output = self._model(input)
-                    loss = self.get_loss(local_rank(), data, output)
-                    loss.backward()
-                    self._grad_monitor.monitor_epb(False)
-                    if (index + 1) % accumu_steps == 0:
-                        epb = self._grad_monitor.epb
-                        self._model.zero_grad()
-                        if epb is not None:
-                            sample_epb.append(epb)
-                        if len(sample_epb) >= 3:
-                            sample_epb = np.array(sample_epb)
-                            q1 = np.percentile(sample_epb, 25)
-                            q3 = np.percentile(sample_epb, 75)
-                            iqr = q3 - q1
-                            lower_bound = q1 - 1.5 * iqr
-                            upper_bound = q3 + 1.5 * iqr
-                            sample_epb = sample_epb[(sample_epb >= lower_bound) & (sample_epb <= upper_bound)]
-                            epb = sample_epb.mean()
-                            epb_list.append(epb)
-                            ideal_global_bs *= 2
-                            self._grad_monitor.epb_average = None
-                            break
-                    if (index + 1) >= accumu_steps * 10:
-                        epb_list.append(-1)
-                        ideal_global_bs *= 2
-                        self._grad_monitor.epb_average = None
-                        break
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    print("AAAAAAAAAAAAAAAAAAAAAAAAAAA")
-                    break
-                else:
-                    raise
-        print(epb_list)
-        
-        x = np.arange(0, len(epb_list))
-        y = np.array(epb_list)
-        condition = (y >= -5) & (y <= 5)
-        max_start = 0
-        max_end = 0
-        current_start = 0
-        max_length = 0
-        for i in range(len(condition)):
-            if condition[i]:
-                if not condition[i - 1] if i > 0 else True:
-                    current_start = i
-                current_length = i - current_start + 1
-                if current_length > max_length:
-                    max_length = current_length
-                    max_start = current_start
-                    max_end = i
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                pass # handle OOM
             else:
-                current_start = i + 1
-        condition = np.full_like(condition, False)
-        condition[max_start:max_end + 1] = True
-        x = x[condition]
-        y = y[condition]
+                raise
         
-        k = ((x * y).mean() - x.mean() * y.mean()) / ((x ** 2).mean() - (x.mean()) ** 2)
-        b = y.mean() - k * x.mean()
-        print(f"k={k},b={b}", math.ceil(ideal_global_bs / accumu_steps / 2))
+        max_log_bs = np.log2((max_mem - intercept_mem) / slope_mem)
+        max_local_bs = 2 ** np.ceil(max_log_bs)
+        
+        best_global_bs = int(2 ** (GRs_target - best_intercept_GRs) / best_slope_GRs)
         
         
-        self.update_epb_standard()
-        ideal = (self._adjuster.lower_bound + self._adjuster.upper_bound) / 2 + self._adjuster.bias
-        self._ideal_global_bs = math.ceil(2 ** ((ideal - b) / k))
-        self._adjuster.set_init_bs_config(math.ceil(ideal_global_bs / accumu_steps / 2), self._ideal_global_bs * 32)
-        self.adjust_resources()
-        
-            
         
     def run(self):
         self.on_train_start()
