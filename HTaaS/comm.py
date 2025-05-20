@@ -83,7 +83,7 @@ class ServerInstance:
         Returns:
             Tuple[str, Any]: A tuple of command string and data received from the client.
         """
-        request = self._conn.recv(1024)
+        request = self._conn.recv(4096)
         received_data = json.loads(request.decode())
         return received_data["cmd"], received_data["data"]
 
@@ -182,7 +182,7 @@ class ClientInstance:
         Returns:
             Tuple[str, Any]: A tuple containing the command string and associated data received from the server.
         """
-        request = self._conn.recv(1024)
+        request = self._conn.recv(4096)
         received_data = json.loads(request.decode())
         return received_data["cmd"], received_data["data"]
 
